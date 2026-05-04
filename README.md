@@ -21,6 +21,11 @@
   </a>
 </p>
 
+**For locally modified code to install graphify cli
+```
+pip install -e ~/workfolder/github-self/graphify
+```
+
 Type `/graphify` in your AI coding assistant and it maps your entire project — code, docs, PDFs, images, videos — into a knowledge graph you can query instead of grepping through files.
 
 Works in Claude Code, Codex, OpenCode, Cursor, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, Pi, and Google Antigravity.
