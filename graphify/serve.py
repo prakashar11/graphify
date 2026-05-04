@@ -346,6 +346,23 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                     "required": ["source", "target"],
                 },
             ),
+            types.Tool(
+                name="query_types",
+                description="Query the graph for functions/classes by type (e.g., find all functions with uint16_t return type).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "enum": ["functions", "classes", "list-all"],
+                                     "description": "Query functions, classes, or list all types"},
+                        "filter_type": {"type": "string", "enum": ["return", "param", "field"],
+                                        "description": "Filter by return type, parameter type, or field type (required for functions)"},
+                        "type_pattern": {"type": "string", "description": "Type pattern to match (e.g., uint16_t, char*, String). Required when category is 'functions' or 'classes'."},
+                    },
+                    "required": ["category"],
+                    "if": {"properties": {"category": {"enum": ["functions", "classes"]}}},
+                    "then": {"required": ["category", "type_pattern"]},
+                },
+            ),
         ]
 
     def _tool_query_graph(arguments: dict) -> str:
@@ -453,6 +470,90 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
             segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
         return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
 
+    def _tool_query_types(arguments: dict) -> str:
+        from .query import (
+            find_functions_with_return_type,
+            find_functions_with_parameter_type,
+            find_classes_with_field_type,
+            list_all_types,
+        )
+
+        category = arguments.get("category", "")
+        type_pattern = arguments.get("type_pattern", "")
+
+        if category != "list-all" and not type_pattern:
+            return "Error: type_pattern is required for this query"
+
+        if category == "functions":
+            filter_type = arguments.get("filter_type", "")
+            if not filter_type:
+                return "Error: filter_type (return|param) is required for functions"
+            if filter_type == "return":
+                results = find_functions_with_return_type(G, type_pattern)
+                title = f"Functions with return type '{type_pattern}':"
+            elif filter_type == "param":
+                results = find_functions_with_parameter_type(G, type_pattern)
+                title = f"Functions with parameter type '{type_pattern}':"
+            else:
+                return "Error: filter_type must be 'return' or 'param'"
+
+        elif category == "classes":
+            results = find_classes_with_field_type(G, type_pattern)
+            title = f"Classes with field type '{type_pattern}':"
+
+        elif category == "list-all":
+            type_summary = list_all_types(G)
+            lines = ["All types found in graph:"]
+            if type_summary["return_types"]:
+                lines.append("\n  Return types:")
+                for t in type_summary["return_types"][:20]:
+                    lines.append(f"    - {t}")
+                if len(type_summary["return_types"]) > 20:
+                    lines.append(f"    ... and {len(type_summary['return_types']) - 20} more")
+            if type_summary["param_types"]:
+                lines.append("\n  Parameter types:")
+                for t in type_summary["param_types"][:20]:
+                    lines.append(f"    - {t}")
+                if len(type_summary["param_types"]) > 20:
+                    lines.append(f"    ... and {len(type_summary['param_types']) - 20} more")
+            if type_summary["field_types"]:
+                lines.append("\n  Field types:")
+                for t in type_summary["field_types"][:20]:
+                    lines.append(f"    - {t}")
+                if len(type_summary["field_types"]) > 20:
+                    lines.append(f"    ... and {len(type_summary['field_types']) - 20} more")
+            return "\n".join(lines)
+
+        else:
+            return "Error: category must be 'functions', 'classes', or 'list-all'"
+
+        if not results:
+            return f"{title}\n  (none found)"
+
+        lines = [title]
+        if category == "functions":
+            for r in results:
+                lines.append(f"\n  - {r['label']}")
+                if r.get("return_type"):
+                    lines.append(f"    Return: {r['return_type']}")
+                lines.append(f"    File: {r['source_file']}")
+                if r.get("parameters"):
+                    params_str = ", ".join(
+                        f"{p['name']}: {p['type']}"
+                        for p in r["parameters"]
+                        if p["name"]
+                    )
+                    if params_str:
+                        lines.append(f"    Params: {params_str}")
+        elif category == "classes":
+            for r in results:
+                lines.append(f"\n  - {r['label']}")
+                lines.append(f"    File: {r['source_file']}")
+                for f in r.get("matching_fields", []):
+                    lines.append(f"    Field: {f['name']}: {f['type']}")
+
+        return "\n".join(lines)
+
     _handlers = {
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
@@ -461,6 +562,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         "god_nodes": _tool_god_nodes,
         "graph_stats": _tool_graph_stats,
         "shortest_path": _tool_shortest_path,
+        "query_types": _tool_query_types,
     }
 
     @server.call_tool()

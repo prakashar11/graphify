@@ -832,6 +832,184 @@ def _read_csharp_type_name(node, source: bytes) -> str | None:
     return None
 
 
+# ── Type extraction helpers ───────────────────────────────────────────────────
+# These extract structural type information from AST nodes. This is NOT vulnerability
+# analysis — it's pure AST metadata extraction that enables queries like
+# "list all functions with uint16_t parameters".
+
+def _extract_type_name(node, source: bytes) -> str | None:
+    """Extract a type name from a type node (parameter, return type, field)."""
+    if node is None:
+        return None
+    # Direct identifier or predefined type (int, char*, uint16_t, etc.)
+    if node.type in ("identifier", "predefined_type", "type_identifier", "simple_identifier", "primitive_type"):
+        return _read_text(node, source)
+    # Qualified name (std::vector, java.util.List)
+    if node.type == "qualified_name":
+        return _read_text(node, source).split(".")[-1]
+    # Generic name with type parameters (List<int>)
+    if node.type == "generic_name":
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            return _read_text(name_node, source)
+    # Pointer/reference types (char*, int&)
+    if node.type in ("pointer_type", "reference_type"):
+        base = node.child_by_field_name("type") or (node.children[0] if node.children else None)
+        if base:
+            base_type = _extract_type_name(base, source)
+            suffix = "*" if node.type == "pointer_type" else "&"
+            return f"{base_type}{suffix}" if base_type else None
+    # Array type
+    if node.type == "array_type":
+        base = node.child_by_field_name("type")
+        if base:
+            base_type = _extract_type_name(base, source)
+            return f"{base_type}[]" if base_type else "[]"
+    # Type qualifier (const, volatile) — skip anonymous keyword tokens (is_named=False)
+    if node.type in ("const_specifier", "type_qualifier"):
+        for child in node.children:
+            if child.is_named:
+                return f"const {_extract_type_name(child, source)}"
+    # Function pointer (rare, but handled)
+    if node.type == "function_signature":
+        ret = node.child_by_field_name("return_type")
+        if ret:
+            return f"(*{_extract_type_name(ret, source)})"
+    # Fallback: read first named child
+    for child in node.children:
+        if child.is_named:
+            return _extract_type_name(child, source)
+    return None
+
+
+def _extract_function_signature(node, config: LanguageConfig, source: bytes) -> dict | None:
+    """Extract return type and parameters from a function/method declaration."""
+    if node is None:
+        return None
+
+    # Extract return type
+    return_type_node = None
+
+    if node.type == "function_definition":
+        # C/C++/Python/Scala style: type comes before declarator as a sibling child
+        for child in node.children:
+            if child.type in ("type_identifier", "identifier", "qualified_name",
+                              "pointer_type", "const_specifier", "primitive_type"):
+                return_type_node = child
+                break
+            if child.type == "declarator":
+                break
+    else:
+        # Java, C#, Kotlin, Swift, PHP etc.: try named return_type field, then type field
+        return_type_node = (
+            node.child_by_field_name("return_type")
+            or node.child_by_field_name("type")
+        )
+
+    return_type = _extract_type_name(return_type_node, source) if return_type_node else None
+
+    # Extract parameters
+    params: list[dict] = []
+    params_node = node.child_by_field_name("parameters")
+
+    if params_node is None:
+        for child in node.children:
+            if child.type in ("parameter_list", "formal_parameter_list", "signature"):
+                params_node = child
+                break
+            if child.type == "function_declarator":
+                for sub in child.children:
+                    if sub.type == "parameter_list":
+                        params_node = sub
+                        break
+            if params_node:
+                break
+
+    if params_node:
+        for child in params_node.children:
+            if child.type in ("parameter_declaration", "formal_parameter", "declaration"):
+                param_type_node = child.child_by_field_name("type")
+                if param_type_node is None:
+                    for sub in child.children:
+                        if sub.type in ("type_identifier", "identifier", "pointer_type",
+                                        "const_specifier", "array_declarator"):
+                            param_type_node = sub
+                            break
+
+                param_type = _extract_type_name(param_type_node, source) if param_type_node else None
+
+                has_pointer = any(c.type == "pointer_declarator" for c in child.children)
+                if has_pointer and param_type:
+                    param_type = f"{param_type}*"
+
+                param_name_node = child.child_by_field_name("name")
+                if param_name_node is None:
+                    for sub in child.children:
+                        if sub.type in ("identifier", "simple_identifier"):
+                            param_name_node = sub
+                            break
+
+                param_name = _read_text(param_name_node, source) if param_name_node else None
+
+                if param_name is None:
+                    if param_type is not None:
+                        params.append({"name": "", "type": param_type})
+                    continue
+
+                params.append({"name": param_name, "type": param_type or "unknown"})
+
+    if return_type is None and not params:
+        return None
+
+    return {
+        "return_type": return_type,
+        "parameters": params,
+    }
+
+
+def _extract_class_fields(node, config: LanguageConfig, source: bytes) -> list[dict]:
+    """Extract field/property declarations from a class declaration."""
+    fields: list[dict] = []
+
+    body = _find_body(node, config)
+    if not body:
+        return fields
+
+    for child in body.children:
+        if child.type in ("field_declaration", "property_declaration", "member_declaration"):
+            type_node = child.child_by_field_name("type")
+            if type_node is None:
+                for sub in child.children:
+                    if sub.type in ("type_identifier", "identifier", "qualified_name"):
+                        type_node = sub
+                        break
+
+            field_type = _extract_type_name(type_node, source) if type_node else None
+
+            decl_node = child.child_by_field_name("declarator")
+            if decl_node is None:
+                decl_nodes = [c for c in child.children if c.type in ("declarator", "variable_declarator")]
+            else:
+                decl_nodes = [decl_node]
+
+            for decl in decl_nodes:
+                name_node = decl.child_by_field_name("name") if hasattr(decl, "child_by_field_name") else None
+                if name_node is None:
+                    for sub in (decl.children if hasattr(decl, "children") else []):
+                        if sub.type in ("identifier", "simple_identifier"):
+                            name_node = sub
+                            break
+
+                field_name = _read_text(name_node, source) if name_node else None
+                if field_name:
+                    fields.append({
+                        "name": field_name,
+                        "type": field_type or "unknown",
+                    })
+
+    return fields
+
+
 _SWIFT_CONFIG = LanguageConfig(
     ts_module="tree_sitter_swift",
     class_types=frozenset({"class_declaration", "protocol_declaration"}),
@@ -946,6 +1124,14 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             line = node.start_point[0] + 1
             add_node(class_nid, class_name, line)
             add_edge(file_nid, class_nid, "contains", line)
+
+            # Extract class field/property types for structural queries
+            fields = _extract_class_fields(node, config, source)
+            if fields:
+                for n in nodes:
+                    if n["id"] == class_nid:
+                        n["fields"] = fields
+                        break
 
             # Python-specific: inheritance
             if config.ts_module == "tree_sitter_python":
@@ -1166,6 +1352,19 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                 func_nid = _make_id(stem, func_name)
                 add_node(func_nid, f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
+
+            # Extract type metadata for structural queries
+            sig = _extract_function_signature(node, config, source)
+            if sig:
+                for n in nodes:
+                    if n["id"] == func_nid:
+                        if sig["return_type"]:
+                            n["return_type"] = sig["return_type"]
+                        if sig["parameters"]:
+                            n["parameters"] = sig["parameters"]
+                        if parent_class_nid:
+                            n["is_method"] = True
+                        break
 
             body = _find_body(node, config)
             if body:

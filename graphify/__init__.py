@@ -1,4 +1,4 @@
-"""graphify - extract · build · cluster · analyze · report."""
+"""graphify - extract · build · cluster · analyze · report · query."""
 
 
 def __getattr__(name):
@@ -19,6 +19,13 @@ def __getattr__(name):
         "to_svg": ("graphify.export", "to_svg"),
         "to_canvas": ("graphify.export", "to_canvas"),
         "to_wiki": ("graphify.wiki", "to_wiki"),
+        # Type-based query functions
+        "filter_by_type": ("graphify.query", "filter_by_type"),
+        "find_functions_with_return_type": ("graphify.query", "find_functions_with_return_type"),
+        "find_functions_with_parameter_type": ("graphify.query", "find_functions_with_parameter_type"),
+        "find_classes_with_field_type": ("graphify.query", "find_classes_with_field_type"),
+        "list_all_types": ("graphify.query", "list_all_types"),
+        "query": ("graphify.query", "query"),
     }
     if name in _map:
         import importlib

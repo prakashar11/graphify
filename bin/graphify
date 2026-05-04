@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Local wrapper for graphify - uses the source from this directory."""
+import sys
+from pathlib import Path
+
+# Add the parent directory to sys.path so it imports from local source
+repo_root = Path(__file__).parent.parent
+sys.path.insert(0, str(repo_root))
+
+from graphify.__main__ import main
+
+if __name__ == "__main__":
+    main()

@@ -1087,6 +1087,10 @@ def main() -> None:
         print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
         print("  check-update <path>     check needs_update flag and notify if semantic re-extraction is pending (cron-safe)")
         print("  tree                    emit a D3 v7 collapsible-tree HTML for graph.json")
+        print("  type functions return <type>    find functions by return type (e.g., uint16_t, char*)")
+        print("  type functions param <type>     find functions by parameter type")
+        print("  type classes field <type>       find classes by field type")
+        print("  type list-all                   list all unique types in the graph")
         print("    --graph PATH            path to graph.json (default graphify-out/graph.json)")
         print("    --output HTML           output path (default graphify-out/GRAPH_TREE.html)")
         print("    --root PATH             filesystem root for the hierarchy")
@@ -1714,6 +1718,151 @@ def main() -> None:
                 pass
         result = run_benchmark(graph_path, corpus_words=corpus_words)
         print_benchmark(result)
+
+    elif cmd == "type":
+        # Type-based structural queries
+        # Usage: graphify type functions return uint16_t
+        #        graphify type functions param char*
+        #        graphify type classes field String
+        #        graphify type list-all
+        if len(sys.argv) < 4:
+            print(
+                "Usage: graphify type <category> <filter> <pattern>\n"
+                "  categories: functions, classes\n"
+                "  filters: return, param, field\n"
+                "  patterns: type name (e.g., uint16_t, char*, String)\n"
+                "  or: graphify type list-all",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        graph_path = "graphify-out/graph.json"
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        if not gp.suffix == ".json":
+            print(f"error: graph file must be a .json file", file=sys.stderr)
+            sys.exit(1)
+
+        category = sys.argv[2]  # functions, classes
+
+        try:
+            import json as _json
+            import networkx as _nx
+            from graphify.query import (
+                find_functions_with_return_type,
+                find_functions_with_parameter_type,
+                find_classes_with_field_type,
+                list_all_types,
+            )
+            _raw = _json.loads(gp.read_text(encoding="utf-8"))
+            try:
+                G = _nx.node_link_graph(_raw, edges="links")
+            except TypeError:
+                G = _nx.node_link_graph(_raw)
+
+            if category == "functions":
+                # Check for return or param filter
+                if len(sys.argv) < 5:
+                    print("Usage: graphify type functions <return|param> <type_pattern>", file=sys.stderr)
+                    sys.exit(1)
+                filter_type = sys.argv[3]  # return or param
+                type_pattern = sys.argv[4]
+
+                if filter_type == "return":
+                    results = find_functions_with_return_type(G, type_pattern)
+                    print(f"Functions with return type '{type_pattern}':")
+                elif filter_type == "param":
+                    results = find_functions_with_parameter_type(G, type_pattern)
+                    print(f"Functions with parameter type '{type_pattern}':")
+                else:
+                    print(f"Unknown filter: {filter_type}. Use 'return' or 'param'.", file=sys.stderr)
+                    sys.exit(1)
+
+                if not results:
+                    print("  (none found)")
+                else:
+                    for r in results:
+                        print(f"\n  - {r['label']}")
+                        if r.get('return_type'):
+                            print(f"    Return: {r['return_type']}")
+                        print(f"    File: {r['source_file']}")
+                        if r.get('parameters'):
+                            params_str = ", ".join(
+                                f"{p['name']}: {p['type']}"
+                                for p in r['parameters']
+                                if p['name']
+                            )
+                            if params_str:
+                                print(f"    Params: {params_str}")
+
+            elif category == "classes":
+                if len(sys.argv) < 5:
+                    print("Usage: graphify type classes field <type_pattern>", file=sys.stderr)
+                    sys.exit(1)
+                filter_kw = sys.argv[3]
+                if filter_kw != "field":
+                    print(f"Unknown filter: {filter_kw!r}. Use 'field'.", file=sys.stderr)
+                    sys.exit(1)
+                type_pattern = sys.argv[4]
+
+                results = find_classes_with_field_type(G, type_pattern)
+                print(f"Classes with field type '{type_pattern}':")
+
+                if not results:
+                    print("  (none found)")
+                else:
+                    for r in results:
+                        print(f"\n  - {r['label']}")
+                        print(f"    File: {r['source_file']}")
+                        matching = r.get('matching_fields', [])
+                        for f in matching:
+                            print(f"    Field: {f['name']}: {f['type']}")
+
+            elif category == "list-all":
+                type_summary = list_all_types(G)
+                print("All types found in graph:")
+                if type_summary["return_types"]:
+                    print("\n  Return types:")
+                    for t in type_summary["return_types"][:20]:
+                        print(f"    - {t}")
+                    if len(type_summary["return_types"]) > 20:
+                        print(f"    ... and {len(type_summary['return_types']) - 20} more")
+
+                if type_summary["param_types"]:
+                    print("\n  Parameter types:")
+                    for t in type_summary["param_types"][:20]:
+                        print(f"    - {t}")
+                    if len(type_summary["param_types"]) > 20:
+                        print(f"    ... and {len(type_summary['param_types']) - 20} more")
+
+                if type_summary["field_types"]:
+                    print("\n  Field types:")
+                    for t in type_summary["field_types"][:20]:
+                        print(f"    - {t}")
+                    if len(type_summary["field_types"]) > 20:
+                        print(f"    ... and {len(type_summary['field_types']) - 20} more")
+
+            else:
+                print(f"Unknown category: {category}. Use 'functions', 'classes', or 'list-all'.", file=sys.stderr)
+                sys.exit(1)
+
+        except ImportError as e:
+            print(f"error: networkx not installed: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"error: unknown command '{cmd}'", file=sys.stderr)
         print("Run 'graphify --help' for usage.", file=sys.stderr)
