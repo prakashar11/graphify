@@ -259,6 +259,164 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                                     })
 
 
+def _collect_js_import_bindings(root, source: bytes) -> dict[str, str]:
+    """Walk a JS/TS AST root and return a map of local binding → package name.
+
+    Covers ESM and CommonJS import forms:
+      import jwt from 'jsonwebtoken'              → {"jwt": "jsonwebtoken"}
+      import * as fs from 'fs'                    → {"fs": "fs"}
+      import { decode } from 'jsonwebtoken'       → {"decode": "jsonwebtoken"}
+      const jwt = require('jsonwebtoken')         → {"jwt": "jsonwebtoken"}
+      const { reach } = require('hoek')           → {"reach": "hoek"}
+      const AWS = require('aws-sdk')              → {"AWS": "aws-sdk"}
+
+    Only external packages (non-relative specifiers) are recorded.
+    """
+    bindings: dict[str, str] = {}
+
+    def _require_pkg(call_node) -> str | None:
+        """Return the package name if call_node is require('pkg'), else None."""
+        if call_node.type != "call_expression":
+            return None
+        fn = call_node.child_by_field_name("function")
+        if fn is None or _read_text(fn, source) != "require":
+            return None
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            return None
+        for arg in args.named_children:
+            if arg.type == "string":
+                raw = _read_text(arg, source).strip("'\"` ")
+                if raw and not raw.startswith("."):
+                    return raw
+        return None
+
+    def _handle_declarator(decl_node) -> None:
+        """Extract bindings from a variable_declarator whose value is require(...)."""
+        val = decl_node.child_by_field_name("value")
+        if val is None:
+            return
+        pkg = _require_pkg(val)
+        if pkg is None:
+            return
+        name_node = decl_node.child_by_field_name("name")
+        if name_node is None:
+            return
+        if name_node.type == "identifier":
+            # const jwt = require('jsonwebtoken')
+            bindings[_read_text(name_node, source)] = pkg
+        elif name_node.type == "object_pattern":
+            # const { reach, clone } = require('hoek')
+            for child in name_node.named_children:
+                if child.type == "shorthand_property_identifier_pattern":
+                    bindings[_read_text(child, source)] = pkg
+                elif child.type == "pair_pattern":
+                    key = child.child_by_field_name("key")
+                    if key:
+                        bindings[_read_text(key, source)] = pkg
+
+    def _walk(node) -> None:
+        if node.type == "import_statement":
+            specifier: str | None = None
+            for child in node.children:
+                if child.type == "string":
+                    raw = _read_text(child, source).strip("'\"` ")
+                    if raw and not raw.startswith("."):
+                        specifier = raw
+                    break
+            if specifier:
+                for child in node.children:
+                    if child.type == "import_clause":
+                        for sub in child.children:
+                            if sub.type == "identifier":
+                                bindings[_read_text(sub, source)] = specifier
+                            elif sub.type == "namespace_import":
+                                for sc in sub.children:
+                                    if sc.type == "identifier":
+                                        bindings[_read_text(sc, source)] = specifier
+                            elif sub.type == "named_imports":
+                                for spec in sub.children:
+                                    if spec.type == "import_specifier":
+                                        name_node = spec.child_by_field_name("name")
+                                        if name_node:
+                                            bindings[_read_text(name_node, source)] = specifier
+        elif node.type in ("lexical_declaration", "variable_declaration"):
+            for child in node.children:
+                if child.type == "variable_declarator":
+                    _handle_declarator(child)
+            # Don't recurse further — declarations are top-level, no nested imports
+        else:
+            for child in node.children:
+                _walk(child)
+
+    _walk(root)
+    return bindings
+
+
+def _walk_arg_refs(args_node, source: bytes) -> list[tuple[str, str | int]]:
+    """Collect (identifier_name, arg_key) pairs for function references in call/new arguments.
+
+    arg_key is the 0-based positional index for direct args, or the key string
+    for named/property args:
+      foo(myFn)                           → [("myFn", 0)]         JS/TS/Python
+      foo(a, myFn)                        → [("myFn", 1)]         JS/TS/Python
+      foo({ context: buildContext })      → [("buildContext", "context")]  JS/TS
+      foo(context=build_context)          → [("build_context", "context")] Python
+      foo({'context': build_context})     → [("build_context", "context")] Python
+
+    Only looks one level deep to avoid collecting identifiers from nested
+    sub-expressions.
+    """
+    if args_node is None:
+        return []
+    refs: list[tuple[str, str | int]] = []
+    pos = 0
+    for arg in args_node.named_children:
+        if arg.type == "identifier":
+            # Direct positional arg: foo(myFn)
+            name = _read_text(arg, source)
+            if name:
+                refs.append((name, pos))
+            pos += 1
+        elif arg.type == "keyword_argument":
+            # Python keyword arg: foo(context=build_context)
+            key_node = arg.child_by_field_name("name")
+            val = arg.child_by_field_name("value")
+            if val and val.type == "identifier":
+                name = _read_text(val, source)
+                key = _read_text(key_node, source) if key_node else name
+                if name:
+                    refs.append((name, key))
+            pos += 1
+        elif arg.type == "object":
+            # JS/TS object literal: foo({ context: buildContext })
+            pos += 1
+            for pair in arg.named_children:
+                if pair.type == "pair":
+                    key_node = pair.child_by_field_name("key")
+                    val = pair.child_by_field_name("value")
+                    if val and val.type == "identifier":
+                        name = _read_text(val, source)
+                        key = _read_text(key_node, source) if key_node else ""
+                        if name:
+                            refs.append((name, key if key else name))
+        elif arg.type == "dictionary":
+            # Python dict literal: foo({'context': build_context})
+            pos += 1
+            for pair in arg.named_children:
+                if pair.type == "pair":
+                    key_node = pair.child_by_field_name("key")
+                    val = pair.child_by_field_name("value")
+                    if val and val.type == "identifier":
+                        name = _read_text(val, source)
+                        key = _read_text(key_node, source).strip("'\"") if key_node else ""
+                        if name:
+                            refs.append((name, key if key else name))
+        else:
+            pos += 1
+    return refs
+
+
 def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edges: list,
                        seen_dyn_pairs: set) -> bool:
     """Detect dynamic import() calls in JS/TS and emit imports_from edges.
@@ -1408,6 +1566,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     seen_static_ref_pairs: set[tuple[str, str, str]] = set()
     seen_helper_ref_pairs: set[tuple[str, str, str]] = set()
     seen_bind_pairs: set[tuple[str, str, str]] = set()
+    seen_arg_ref_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []  # unresolved calls for cross-file resolution in extract()
 
     def _php_class_const_scope(n) -> str | None:
@@ -1437,6 +1596,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
             callee_name: str | None = None
             is_member_call: bool = False
+            member_object: str | None = None
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
@@ -1539,6 +1699,10 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             attr = func_node.child_by_field_name(config.call_accessor_field)
                             if attr:
                                 callee_name = _read_text(attr, source)
+                        # Capture the object side (e.g. "jwt" from jwt.decode())
+                        obj_node = func_node.child_by_field_name("object")
+                        if obj_node:
+                            member_object = _read_text(obj_node, source)
                     else:
                         # Try reading the node directly (e.g. Java name field is the callee)
                         callee_name = _read_text(func_node, source)
@@ -1566,9 +1730,45 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                         "caller_nid": caller_nid,
                         "callee": callee_name,
                         "is_member_call": is_member_call,
+                        "member_object": member_object,
                         "source_file": str_path,
                         "source_location": f"L{node.start_point[0] + 1}",
                     })
+
+            # JS/TS/Python: scan call arguments for function references passed as values.
+            # Covers: foo(myFn) and foo(context=build_context)
+            if config.ts_module in ("tree_sitter_typescript", "tree_sitter_javascript",
+                                    "tree_sitter_python"):
+                args_node = node.child_by_field_name("arguments")
+                line = node.start_point[0] + 1
+                for ref_name, arg_key in _walk_arg_refs(args_node, source):
+                    if ref_name == callee_name:
+                        continue  # already captured as callee
+                    ref_nid = label_to_nid.get(ref_name.lower())
+                    if ref_nid and ref_nid != caller_nid:
+                        pair = (caller_nid, ref_nid)
+                        if pair not in seen_arg_ref_pairs:
+                            seen_arg_ref_pairs.add(pair)
+                            edges.append({
+                                "source": caller_nid,
+                                "target": ref_nid,
+                                "relation": "references",
+                                "context": "arg_ref",
+                                "arg_key": arg_key,
+                                "confidence": "EXTRACTED",
+                                "source_file": str_path,
+                                "source_location": f"L{line}",
+                                "weight": 1.0,
+                            })
+                    elif ref_name and not ref_nid:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": ref_name,
+                            "is_arg_ref": True,
+                            "arg_key": arg_key,
+                            "source_file": str_path,
+                            "source_location": f"L{line}",
+                        })
 
             # Helper function calls: config('foo.bar') → uses_config edge to "foo"
             if (callee_name and callee_name in config.helper_fn_names):
@@ -1673,6 +1873,90 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             "weight": 1.0,
                         })
 
+        # JS/TS new_expression: scan arguments for function references in object props.
+        # Covers: new ApolloServer({ context: buildContext })
+        if (config.ts_module in ("tree_sitter_typescript", "tree_sitter_javascript")
+                and node.type == "new_expression"):
+            args_node = node.child_by_field_name("arguments")
+            line = node.start_point[0] + 1
+            for ref_name, arg_key in _walk_arg_refs(args_node, source):
+                ref_nid = label_to_nid.get(ref_name.lower())
+                if ref_nid and ref_nid != caller_nid:
+                    pair = (caller_nid, ref_nid)
+                    if pair not in seen_arg_ref_pairs:
+                        seen_arg_ref_pairs.add(pair)
+                        edges.append({
+                            "source": caller_nid,
+                            "target": ref_nid,
+                            "relation": "references",
+                            "context": "arg_ref",
+                            "arg_key": arg_key,
+                            "confidence": "EXTRACTED",
+                            "source_file": str_path,
+                            "source_location": f"L{line}",
+                            "weight": 1.0,
+                        })
+                elif ref_name and not ref_nid:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": ref_name,
+                        "is_arg_ref": True,
+                        "arg_key": arg_key,
+                        "source_file": str_path,
+                        "source_location": f"L{line}",
+                    })
+
+        # JS/TS object literal OR Python dict literal: scan property values for
+        # function references. Covers return values and assignments, e.g.:
+        #   buildConfig = () => ({ context: buildContext })   ← TS
+        #   def build_config(): return {'context': build_context}  ← Python
+        # The call-arg path already handles these inside call/new arguments;
+        # seen_arg_ref_pairs deduplicates any overlap.
+        _is_obj_node = (
+            config.ts_module in ("tree_sitter_typescript", "tree_sitter_javascript")
+            and node.type == "object"
+        ) or (
+            config.ts_module == "tree_sitter_python"
+            and node.type == "dictionary"
+        )
+        if _is_obj_node:
+            line = node.start_point[0] + 1
+            is_python = config.ts_module == "tree_sitter_python"
+            for pair_node in node.named_children:
+                if pair_node.type == "pair":
+                    key_node = pair_node.child_by_field_name("key")
+                    val = pair_node.child_by_field_name("value")
+                    if val and val.type == "identifier":
+                        ref_name = _read_text(val, source)
+                        raw_key = _read_text(key_node, source) if key_node else ref_name
+                        # Python dict keys are string literals — strip quotes
+                        key = raw_key.strip("'\"") if is_python else raw_key
+                        ref_nid = label_to_nid.get(ref_name.lower())
+                        if ref_nid and ref_nid != caller_nid:
+                            pair = (caller_nid, ref_nid)
+                            if pair not in seen_arg_ref_pairs:
+                                seen_arg_ref_pairs.add(pair)
+                                edges.append({
+                                    "source": caller_nid,
+                                    "target": ref_nid,
+                                    "relation": "references",
+                                    "context": "arg_ref",
+                                    "arg_key": key,
+                                    "confidence": "EXTRACTED",
+                                    "source_file": str_path,
+                                    "source_location": f"L{line}",
+                                    "weight": 1.0,
+                                })
+                        elif ref_name and not ref_nid:
+                            raw_calls.append({
+                                "caller_nid": caller_nid,
+                                "callee": ref_name,
+                                "is_arg_ref": True,
+                                "arg_key": key,
+                                "source_file": str_path,
+                                "source_location": f"L{line}",
+                            })
+
         # PHP class constant access: Foo::BAR → references_constant edge
         if config.ts_module == "tree_sitter_php" and node.type == "class_constant_access_expression":
             class_name = _php_class_const_scope(node)
@@ -1722,6 +2006,53 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             "weight": 1.0,
         })
 
+    # Collect import bindings for JS/TS so member calls on imported objects
+    # (e.g. jwt.decode() where jwt is from 'jsonwebtoken') can be resolved.
+    import_bindings: dict[str, str] = {}
+    if config.ts_module in ("tree_sitter_typescript", "tree_sitter_javascript"):
+        import_bindings = _collect_js_import_bindings(root, source)
+
+    # ── Resolve import-backed member calls → calls_external edges ─────────────
+    # For each unresolved raw_call where is_member_call=True and the object is a
+    # known import binding, emit a calls_external edge to a synthetic external node.
+    seen_ext_pairs: set[tuple[str, str]] = set()
+    for rc in raw_calls:
+        if not rc.get("is_member_call"):
+            continue
+        member_obj = rc.get("member_object", "")
+        pkg = import_bindings.get(member_obj) if member_obj else None
+        if not pkg:
+            continue
+        callee = rc.get("callee", "")
+        if not callee:
+            continue
+        ext_label = f"{pkg}.{callee}"
+        ext_nid = _make_id("ext", pkg, callee)
+        if ext_nid not in seen_ids:
+            seen_ids.add(ext_nid)
+            nodes.append({
+                "id": ext_nid,
+                "label": ext_label,
+                "file_type": "external_call",
+                "source_file": "",
+                "source_location": "",
+            })
+        caller = rc["caller_nid"]
+        pair = (caller, ext_nid)
+        if caller != ext_nid and pair not in seen_ext_pairs:
+            seen_ext_pairs.add(pair)
+            edges.append({
+                "source": caller,
+                "target": ext_nid,
+                "relation": "calls_external",
+                "context": "call",
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "source_file": str_path,
+                "source_location": rc.get("source_location", ""),
+                "weight": 1.0,
+            })
+
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
     clean_edges = []
@@ -1730,7 +2061,8 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
             clean_edges.append(edge)
 
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls,
+            "import_bindings": import_bindings, "source_file": str_path}
 
 
 # ── Python rationale extraction ───────────────────────────────────────────────
@@ -3832,16 +4164,21 @@ def extract_elixir(path: Path) -> dict:
 
 
 def _check_tree_sitter_version() -> None:
-    """Raise a clear error if tree-sitter is too old for the new Language API."""
+    """Raise a clear error if tree-sitter is missing or too old for the new Language API."""
     try:
-        from tree_sitter import LANGUAGE_VERSION
+        import tree_sitter as _ts
     except ImportError:
         raise ImportError(
             "tree-sitter is not installed. Run: pip install 'tree-sitter>=0.23.0'"
         )
-    # Language API v2 starts at LANGUAGE_VERSION 14
+    # LANGUAGE_VERSION was removed in tree-sitter 0.24+; its absence means the
+    # package is recent enough that Language API v2 is guaranteed.
+    try:
+        from tree_sitter import LANGUAGE_VERSION
+    except ImportError:
+        return  # 0.24+ removed the constant; API v2 is present
+    # Still present (older build) — enforce the minimum
     if LANGUAGE_VERSION < 14:
-        import tree_sitter as _ts
         raise RuntimeError(
             f"tree-sitter {getattr(_ts, '__version__', 'unknown')} is too old. "
             f"graphify requires tree-sitter >= 0.23.0 (Language API v2). "
@@ -4145,15 +4482,57 @@ def extract(
             key = normalised.lower()
             global_label_to_nids.setdefault(key, []).append(n["id"])
 
+    # Build per-file import bindings index: source_file → {local_binding: package}
+    # Used to resolve member calls where the object is an imported external package.
+    per_file_bindings: dict[str, dict[str, str]] = {}
+    for result in per_file:
+        sf = result.get("source_file", "")
+        bindings = result.get("import_bindings")
+        if sf and bindings:
+            per_file_bindings[sf] = bindings
+
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
+    ext_nodes_seen: set[str] = set()
     for result in per_file:
         for rc in result.get("raw_calls", []):
             callee = rc.get("callee", "")
             if not callee:
                 continue
-            # Skip member-call callees: obj.log() → "log" has no import evidence
-            # and collides with any top-level function named "log" in the corpus.
+            # Member-call callees (obj.method()) are skipped by default because
+            # "method" has no import evidence and collides with same-named functions.
+            # Exception: when the object is a known import binding (e.g. jwt from
+            # 'jsonwebtoken'), we can emit a calls_external edge with full fidelity.
             if rc.get("is_member_call"):
+                member_obj = rc.get("member_object", "")
+                src_file = rc.get("source_file", "")
+                pkg = per_file_bindings.get(src_file, {}).get(member_obj) if member_obj else None
+                if pkg is None:
+                    continue  # unknown object — skip as before
+                ext_label = f"{pkg}.{callee}"
+                ext_nid = _make_id("ext", pkg, callee)
+                if ext_nid not in ext_nodes_seen:
+                    ext_nodes_seen.add(ext_nid)
+                    all_nodes.append({
+                        "id": ext_nid,
+                        "label": ext_label,
+                        "file_type": "external_call",
+                        "source_file": "",
+                        "source_location": "",
+                    })
+                caller = rc["caller_nid"]
+                if (caller, ext_nid) not in existing_pairs:
+                    existing_pairs.add((caller, ext_nid))
+                    all_edges.append({
+                        "source": caller,
+                        "target": ext_nid,
+                        "relation": "calls_external",
+                        "context": "call",
+                        "confidence": "EXTRACTED",
+                        "confidence_score": 1.0,
+                        "source_file": src_file,
+                        "source_location": rc.get("source_location"),
+                        "weight": 1.0,
+                    })
                 continue
             candidates = global_label_to_nids.get(callee.lower(), [])
             # Skip ambiguous names that resolve to multiple nodes — these are
@@ -4163,19 +4542,27 @@ def extract(
                 continue
             tgt = candidates[0]
             caller = rc["caller_nid"]
-            if tgt != caller and (caller, tgt) not in existing_pairs:
+            if tgt == caller:
+                continue
+            is_arg_ref = rc.get("is_arg_ref", False)
+            relation = "references" if is_arg_ref else "calls"
+            context = "arg_ref" if is_arg_ref else "call"
+            if (caller, tgt) not in existing_pairs:
                 existing_pairs.add((caller, tgt))
-                all_edges.append({
+                edge: dict = {
                     "source": caller,
                     "target": tgt,
-                    "relation": "calls",
-                    "context": "call",
+                    "relation": relation,
+                    "context": context,
                     "confidence": "INFERRED",
                     "confidence_score": 0.8,
                     "source_file": rc.get("source_file", ""),
                     "source_location": rc.get("source_location"),
                     "weight": 1.0,
-                })
+                }
+                if is_arg_ref and "arg_key" in rc:
+                    edge["arg_key"] = rc["arg_key"]
+                all_edges.append(edge)
 
     # Relativize source_file fields so paths are portable across machines (#555)
     for item in all_nodes + all_edges:

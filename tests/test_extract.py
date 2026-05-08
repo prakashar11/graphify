@@ -197,3 +197,107 @@ def test_cross_file_calls_skip_ambiguous_duplicate_labels(tmp_path):
         nodes[e["source"]]["label"] == "run()" and nodes[e["target"]]["label"] == "log()"
         for e in calls
     )
+
+
+# ── Python argument reference tracking ───────────────────────────────────────
+
+def test_python_arg_ref_positional():
+    """pass_around(build_context) should produce a references edge with numeric arg_key."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    targets = {node_by_id.get(e["target"], "") for e in ref_edges}
+    assert any("build_context" in t for t in targets), \
+        f"Expected references edge to build_context, got: {targets}"
+    positional = [e for e in ref_edges
+                  if "build_context" in node_by_id.get(e["target"], "")
+                  and isinstance(e.get("arg_key"), int)]
+    assert positional, "Expected numeric arg_key for positional reference"
+    assert positional[0]["arg_key"] == 0
+
+
+def test_python_arg_ref_keyword():
+    """GraphQLSchema(context=build_context) should produce a references edge with arg_key='context'."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    named = [e for e in ref_edges
+             if "build_context" in node_by_id.get(e["target"], "")
+             and e.get("arg_key") == "context"]
+    assert named, \
+        f"Expected references edge with arg_key='context', got arg_keys: " \
+        f"{[e.get('arg_key') for e in ref_edges if 'build_context' in node_by_id.get(e['target'], '')]}"
+
+
+def test_python_arg_ref_caller_is_function():
+    """Source of the references edge should be the enclosing function, not the file node."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "build_context" in n["label"]), None)
+    assert build_ctx_nid, "build_context node not found"
+    edges_to_ctx = [e for e in ref_edges if e["target"] == build_ctx_nid]
+    assert edges_to_ctx, "No references edges to build_context"
+    sources = {node_by_id.get(e["source"], "") for e in edges_to_ctx}
+    assert any(s not in ("", "arg_refs.py") for s in sources), \
+        f"Expected function-level source, got: {sources}"
+
+
+def test_python_arg_ref_no_self_loops():
+    """No references edge should have source == target."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    self_loops = [e for e in r["edges"]
+                  if e["relation"] == "references" and e["source"] == e["target"]]
+    assert not self_loops, f"Self-referencing edges found: {self_loops}"
+
+
+def test_python_arg_ref_confidence():
+    """In-file arg references should have EXTRACTED confidence."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    assert ref_edges, "Expected at least one arg_ref references edge"
+    assert all(e["confidence"] == "EXTRACTED" for e in ref_edges)
+
+
+def test_python_dict_literal_as_positional_arg():
+    """foo({'context': build_context}) — dict literal as positional call arg should
+    produce a references edge with arg_key='context' (Gap 1)."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "build_context" in n["label"]), None)
+    assert build_ctx_nid, "build_context node not found"
+    dict_arg_edges = [e for e in ref_edges
+                      if e["target"] == build_ctx_nid
+                      and e.get("arg_key") == "context"
+                      and "build_server_dict_arg" in node_by_id.get(e["source"], "")]
+    assert dict_arg_edges, (
+        f"Expected build_server_dict_arg → references(context) → build_context via dict arg. "
+        f"All arg_ref edges to build_context: "
+        f"{[(node_by_id.get(e['source']), e.get('arg_key')) for e in ref_edges if e['target'] == build_ctx_nid]}"
+    )
+
+
+def test_python_dict_return_value():
+    """def build_config(): return {'context': build_context} — dict in return value
+    should produce build_config → references(context) → build_context (Gap 2)."""
+    r = extract_python(FIXTURES / "arg_refs.py")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "build_context" in n["label"]), None)
+    assert build_ctx_nid, "build_context node not found"
+    return_dict_edges = [e for e in ref_edges
+                         if e["target"] == build_ctx_nid
+                         and e.get("arg_key") == "context"
+                         and "build_config" in node_by_id.get(e["source"], "")]
+    assert return_dict_edges, (
+        f"Expected build_config → references(context) → build_context via return dict. "
+        f"All arg_ref edges to build_context: "
+        f"{[(node_by_id.get(e['source']), e.get('arg_key')) for e in ref_edges if e['target'] == build_ctx_nid]}"
+    )

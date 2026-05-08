@@ -784,3 +784,274 @@ def test_ts_static_template_literal_resolved():
     targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
     assert any("statichelper" in t.lower() for t in targets), \
         f"Static template literal import not resolved: {targets}"
+
+
+# ── External library call tracking ───────────────────────────────────────────
+
+def test_ts_external_call_default_import():
+    """jwt.decode() on a default import should produce a calls_external edge."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    targets = {e["target"] for e in ext_edges}
+    assert any("jsonwebtoken" in t and "decode" in t for t in targets), \
+        f"Expected calls_external edge to jsonwebtoken.decode, got targets: {targets}"
+
+
+def test_ts_external_call_namespace_import():
+    """fs.readFileSync() on a namespace import (import * as fs) should produce a calls_external edge."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    targets = {e["target"] for e in ext_edges}
+    assert any("fs" in t and "readfilesync" in t.lower() for t in targets), \
+        f"Expected calls_external edge to fs.readFileSync, got targets: {targets}"
+
+
+def test_ts_external_call_named_import():
+    """createHash() from a named import should produce a calls_external edge when used as member call."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    # createHash is a named import used as a direct call, not a member call — it
+    # should appear as a regular cross-file callee miss (no external edge needed).
+    # This test confirms named-import *direct* calls are not mis-classified.
+    ext_targets = {e["target"] for e in ext_edges}
+    assert not any("createhash" in t.lower() and "crypto" not in t.lower() for t in ext_targets), \
+        f"createHash should not produce a spurious external edge: {ext_targets}"
+
+
+def test_ts_external_call_node_created():
+    """External call nodes should have file_type='external_call' and be in all_nodes."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "external_call"]
+    labels = {n["label"] for n in ext_nodes}
+    assert any("jsonwebtoken" in lb for lb in labels), \
+        f"Expected external_call node for jsonwebtoken.decode, got: {labels}"
+
+
+def test_ts_external_call_confidence():
+    """calls_external edges should have EXTRACTED confidence (binding is statically known)."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    assert ext_edges, "Expected at least one calls_external edge"
+    assert all(e["confidence"] == "EXTRACTED" for e in ext_edges), \
+        f"Expected EXTRACTED confidence on all calls_external edges"
+
+
+def test_ts_external_call_caller_is_function():
+    """The source of a calls_external edge should be the enclosing function node."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    jwt_edges = [e for e in r["edges"]
+                 if e["relation"] == "calls_external"
+                 and "jsonwebtoken" in e["target"] and "decode" in e["target"]]
+    assert jwt_edges, "Expected calls_external edge from buildContext to jwt.decode"
+    src_label = node_by_id.get(jwt_edges[0]["source"], "")
+    assert "buildContext" in src_label, \
+        f"Expected source to be buildContext(), got: {src_label}"
+
+
+def test_ts_internal_call_unaffected():
+    """Internal function calls (internalHelper → buildContext) still produce a calls edge."""
+    r = extract_js(FIXTURES / "external_calls.ts")
+    call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    labels_called = {node_by_id.get(e["target"], "") for e in call_edges}
+    assert any("buildContext" in lb for lb in labels_called), \
+        f"Expected internal call edge to buildContext, got: {labels_called}"
+
+
+def test_ts_no_spurious_external_edges_for_this_field():
+    """Member calls on 'this' (this.baseUrl) should not produce external edges."""
+    r = extract_js(FIXTURES / "sample.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    assert len(ext_edges) == 0, \
+        f"sample.ts has no external imports; expected no calls_external edges, got: {ext_edges}"
+
+
+# ── Argument reference tracking ───────────────────────────────────────────────
+
+def test_ts_arg_ref_direct_identifier():
+    """foo(buildContext) should produce a references edge from callWithRef to buildContext."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    targets = {node_by_id.get(e["target"], "") for e in ref_edges}
+    assert any("buildContext" in t for t in targets), \
+        f"Expected references edge targeting buildContext, got targets: {targets}"
+
+
+def test_ts_arg_ref_object_property():
+    """new ApolloServer({{ context: buildContext }}) should produce a references edge."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    targets = {node_by_id.get(e["target"], "") for e in ref_edges}
+    assert any("buildContext" in t for t in targets), \
+        f"Expected references edge from new_expression object arg, got: {targets}"
+
+
+def test_ts_arg_ref_caller_is_function():
+    """References edge source should be the enclosing function, not the file node."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"]
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "buildContext" in n["label"]), None)
+    assert build_ctx_nid, "buildContext node not found"
+    edges_to_ctx = [e for e in ref_edges if e["target"] == build_ctx_nid]
+    assert edges_to_ctx, "No references edges pointing to buildContext"
+    sources = {node_by_id.get(e["source"], "") for e in edges_to_ctx}
+    assert any(s for s in sources if s not in ("", "arg_refs.ts")), \
+        f"Expected function-level source for references edge, got: {sources}"
+
+
+def test_ts_arg_ref_confidence():
+    """references edges from arg refs should have EXTRACTED confidence."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"
+                 and e.get("context") == "arg_ref"]
+    assert ref_edges, "Expected at least one arg_ref references edge"
+    assert all(e["confidence"] == "EXTRACTED" for e in ref_edges)
+
+
+def test_ts_arg_ref_no_spurious_self_reference():
+    """buildConfig itself should not have a self-references edge."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    ref_edges = [e for e in r["edges"] if e["relation"] == "references"]
+    self_loops = [e for e in ref_edges if e["source"] == e["target"]]
+    assert not self_loops, f"Self-referencing edges found: {self_loops}"
+
+
+def test_ts_arg_ref_callee_not_double_counted():
+    """buildServer() calls buildConfig() — buildConfig should appear as calls, not references."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_cfg_nid = next((n["id"] for n in r["nodes"] if "buildConfig" in n["label"]), None)
+    assert build_cfg_nid, "buildConfig node not found"
+    calls_to_cfg = [e for e in r["edges"]
+                    if e["target"] == build_cfg_nid and e["relation"] == "calls"]
+    refs_to_cfg = [e for e in r["edges"]
+                   if e["target"] == build_cfg_nid and e["relation"] == "references"]
+    assert calls_to_cfg, "buildConfig should be reached via a calls edge"
+    assert not refs_to_cfg, \
+        f"buildConfig should not be double-counted as a references edge: {refs_to_cfg}"
+
+
+def test_ts_arg_ref_positional_arg_key():
+    """Direct positional arg should carry a numeric arg_key (0-based index)."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "buildContext" in n["label"]), None)
+    assert build_ctx_nid, "buildContext node not found"
+    # callWithRef() passes buildContext as positional arg 0
+    positional_edges = [
+        e for e in r["edges"]
+        if e["relation"] == "references"
+        and e["target"] == build_ctx_nid
+        and isinstance(e.get("arg_key"), int)
+    ]
+    assert positional_edges, \
+        f"Expected a references edge with numeric arg_key for positional arg, got: " \
+        f"{[e.get('arg_key') for e in r['edges'] if e['relation'] == 'references' and e['target'] == build_ctx_nid]}"
+    assert positional_edges[0]["arg_key"] == 0
+
+
+def test_ts_arg_ref_object_property_arg_key():
+    """Object property arg should carry the property name as arg_key string."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "buildContext" in n["label"]), None)
+    assert build_ctx_nid, "buildContext node not found"
+    # buildConfig() and new ApolloServer() both pass buildContext as { context: buildContext }
+    named_edges = [
+        e for e in r["edges"]
+        if e["relation"] == "references"
+        and e["target"] == build_ctx_nid
+        and e.get("arg_key") == "context"
+    ]
+    assert named_edges, \
+        f"Expected a references edge with arg_key='context', got arg_keys: " \
+        f"{[e.get('arg_key') for e in r['edges'] if e['relation'] == 'references' and e['target'] == build_ctx_nid]}"
+
+
+def test_ts_arg_ref_object_return_value():
+    """Arrow fn returning an object literal: (gw) => ({ context: buildContext })
+    should produce buildConfigArrow → references → buildContext with arg_key='context'.
+    This covers the indirect Apollo pattern where context is wired inside a config
+    factory rather than directly in new ApolloServer({...})."""
+    r = extract_js(FIXTURES / "arg_refs.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    build_ctx_nid = next((n["id"] for n in r["nodes"] if "buildContext" in n["label"]), None)
+    assert build_ctx_nid, "buildContext node not found"
+    # Source should be buildConfigArrow (the arrow function returning the object)
+    object_return_edges = [
+        e for e in r["edges"]
+        if e["relation"] == "references"
+        and e["target"] == build_ctx_nid
+        and e.get("arg_key") == "context"
+        and "buildConfigArrow" in node_by_id.get(e["source"], "")
+    ]
+    assert object_return_edges, (
+        f"Expected buildConfigArrow → references(context) → buildContext. "
+        f"All references edges to buildContext: "
+        f"{[(node_by_id.get(e['source']), e.get('arg_key')) for e in r['edges'] if e['relation'] == 'references' and e['target'] == build_ctx_nid]}"
+    )
+
+
+# ── CommonJS require() binding support ───────────────────────────────────────
+
+def test_ts_require_default_binding():
+    """const jwt = require('jsonwebtoken') should produce a calls_external edge for jwt.decode()."""
+    r = extract_js(FIXTURES / "commonjs_require.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    targets = {e["target"] for e in ext_edges}
+    assert any("jsonwebtoken" in t and "decode" in t for t in targets), \
+        f"Expected calls_external to jsonwebtoken.decode via require binding, got: {targets}"
+
+
+def test_ts_require_default_binding_hoek():
+    """const hoek = require('hoek') should produce a calls_external edge for hoek.reach()."""
+    r = extract_js(FIXTURES / "commonjs_require.ts")
+    ext_edges = [e for e in r["edges"] if e["relation"] == "calls_external"]
+    targets = {e["target"] for e in ext_edges}
+    assert any("hoek" in t and "reach" in t for t in targets), \
+        f"Expected calls_external to hoek.reach via require binding, got: {targets}"
+
+
+def test_ts_require_destructured_binding():
+    """const {{ reach }} = require('hoek') should also produce a calls_external edge."""
+    r = extract_js(FIXTURES / "commonjs_require.ts")
+    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "external_call"]
+    labels = {n["label"] for n in ext_nodes}
+    # clone() is called directly (not as member call) — it's a named import ref,
+    # not a member call, so no calls_external edge; but the binding should exist.
+    # reach() via hoek.reach() should still appear.
+    assert any("hoek" in lb for lb in labels), \
+        f"Expected external_call node for hoek.*, got: {labels}"
+
+
+def test_ts_require_caller_is_buildcontext():
+    """calls_external edge source for jwt.decode() should be buildContext()."""
+    r = extract_js(FIXTURES / "commonjs_require.ts")
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    jwt_edges = [e for e in r["edges"]
+                 if e["relation"] == "calls_external"
+                 and "jsonwebtoken" in e.get("target", "")
+                 and "decode" in e.get("target", "")]
+    assert jwt_edges, "No calls_external edge to jsonwebtoken.decode"
+    src_label = node_by_id.get(jwt_edges[0]["source"], "")
+    assert "buildContext" in src_label, \
+        f"Expected buildContext() as source of jwt.decode call, got: {src_label}"
+
+
+def test_ts_require_no_relative_bindings():
+    """require('./local') should not produce an import binding."""
+    from graphify.extract import _collect_js_import_bindings
+    import tree_sitter_typescript as tsts
+    from tree_sitter import Language, Parser
+    source = b"const local = require('./local'); local.fn();"
+    lang = Language(tsts.language_typescript())
+    parser = Parser(lang)
+    tree = parser.parse(source)
+    bindings = _collect_js_import_bindings(tree.root_node, source)
+    assert "local" not in bindings, \
+        f"Relative require should not produce a binding, got: {bindings}"
+

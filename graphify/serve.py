@@ -67,9 +67,12 @@ _CONTEXT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("call", ("call", "calls", "called", "invoke", "invokes", "invoked")),
     ("import", ("import", "imports", "imported", "module", "modules")),
     ("field", ("field", "fields", "member", "members", "property", "properties")),
-    ("parameter_type", ("parameter", "parameters", "param", "params", "argument", "arguments")),
+    ("parameter_type", ("parameter", "parameters", "param", "params")),
     ("return_type", ("return", "returns", "returned")),
     ("generic_arg", ("generic", "generics", "template", "templates")),
+    # arg_ref: function passed as a value (callback, wired as kwarg, object property)
+    ("arg_ref", ("callback", "callbacks", "wired", "passed", "handler", "handlers",
+                 "arg_ref", "argument_ref")),
 )
 
 
