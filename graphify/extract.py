@@ -18,6 +18,11 @@ def _make_id(*parts: str) -> str:
     return cleaned.strip("_").lower()
 
 
+def _normalize_hint(s: str) -> str:
+    """Lowercase and strip non-alphanumeric chars — used for last-segment member call matching."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
 def _file_stem(path: Path) -> str:
     """Return a stem qualified with the parent directory name to avoid ID collisions
     when multiple files share the same filename in different directories (#550)."""
@@ -2033,7 +2038,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             nodes.append({
                 "id": ext_nid,
                 "label": ext_label,
-                "file_type": "external_call",
+                "file_type": "concept",
                 "source_file": "",
                 "source_location": "",
             })
@@ -4491,6 +4496,19 @@ def extract(
         if sf and bindings:
             per_file_bindings[sf] = bindings
 
+    # nid → source_file path (used for last-segment and import-guided disambiguation)
+    nid_to_source_file: dict[str, str] = {
+        n["id"]: n.get("source_file", "") for n in all_nodes
+    }
+    # caller source_file → set of source_file paths reachable via import edges
+    file_to_imported_src_files: dict[str, set[str]] = {}
+    for _e in all_edges:
+        if _e.get("relation") in ("imports", "imports_from"):
+            _caller_sf = _e.get("source_file", "")
+            _tgt_sf = nid_to_source_file.get(_e.get("target", ""), "")
+            if _caller_sf and _tgt_sf:
+                file_to_imported_src_files.setdefault(_caller_sf, set()).add(_tgt_sf)
+
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
     ext_nodes_seen: set[str] = set()
     for result in per_file:
@@ -4498,41 +4516,99 @@ def extract(
             callee = rc.get("callee", "")
             if not callee:
                 continue
-            # Member-call callees (obj.method()) are skipped by default because
-            # "method" has no import evidence and collides with same-named functions.
-            # Exception: when the object is a known import binding (e.g. jwt from
-            # 'jsonwebtoken'), we can emit a calls_external edge with full fidelity.
+            # Member-call callees (obj.method()) — two paths:
+            # 1. Object is a known import binding (e.g. jwt) → calls_external edge.
+            # 2. Otherwise → 4-step intra-repo disambiguation.
             if rc.get("is_member_call"):
                 member_obj = rc.get("member_object", "")
                 src_file = rc.get("source_file", "")
                 pkg = per_file_bindings.get(src_file, {}).get(member_obj) if member_obj else None
-                if pkg is None:
-                    continue  # unknown object — skip as before
-                ext_label = f"{pkg}.{callee}"
-                ext_nid = _make_id("ext", pkg, callee)
-                if ext_nid not in ext_nodes_seen:
-                    ext_nodes_seen.add(ext_nid)
-                    all_nodes.append({
-                        "id": ext_nid,
-                        "label": ext_label,
-                        "file_type": "external_call",
-                        "source_file": "",
-                        "source_location": "",
-                    })
+                if pkg is not None:
+                    # Known external package → calls_external node + edge
+                    ext_label = f"{pkg}.{callee}"
+                    ext_nid = _make_id("ext", pkg, callee)
+                    if ext_nid not in ext_nodes_seen:
+                        ext_nodes_seen.add(ext_nid)
+                        all_nodes.append({
+                            "id": ext_nid,
+                            "label": ext_label,
+                            "file_type": "concept",
+                            "source_file": "",
+                            "source_location": "",
+                        })
+                    caller = rc["caller_nid"]
+                    if (caller, ext_nid) not in existing_pairs:
+                        existing_pairs.add((caller, ext_nid))
+                        all_edges.append({
+                            "source": caller,
+                            "target": ext_nid,
+                            "relation": "calls_external",
+                            "context": "call",
+                            "confidence": "EXTRACTED",
+                            "confidence_score": 1.0,
+                            "source_file": src_file,
+                            "source_location": rc.get("source_location"),
+                            "weight": 1.0,
+                        })
+                    continue
+
+                # 4-step intra-repo member call disambiguation:
+                # Step 1: exactly 1 global match → EXTRACTED (unambiguous)
+                # Step 2: last-segment hint — normalize the last part of the chain
+                #         (e.g. "organizationSettingV2" from "ctx.dataSources.organizationSettingV2")
+                #         and filter candidates whose source_file contains it
+                # Step 3: import-guided — filter to candidates in files imported by caller
+                # Step 4: cap at 3 — if still ambiguous, skip rather than pollute graph
+                mc_candidates = global_label_to_nids.get(callee.lower(), [])
+                if not mc_candidates:
+                    continue
+
+                if len(mc_candidates) == 1:
+                    mc_resolved = mc_candidates
+                    mc_conf, mc_conf_score = "EXTRACTED", 1.0
+                else:
+                    pool = mc_candidates
+                    # Step 2: last-segment hint
+                    last_seg = _normalize_hint(member_obj.split(".")[-1]) if member_obj else ""
+                    if last_seg:
+                        hint_filtered = [
+                            nid for nid in pool
+                            if last_seg in _normalize_hint(nid_to_source_file.get(nid, ""))
+                        ]
+                        if hint_filtered:
+                            pool = hint_filtered
+                    # Step 3: import-guided narrowing
+                    if len(pool) > 1:
+                        imported = file_to_imported_src_files.get(src_file, set())
+                        imp_filtered = [
+                            nid for nid in pool
+                            if nid_to_source_file.get(nid, "") in imported
+                        ]
+                        if imp_filtered:
+                            pool = imp_filtered
+                    # Step 4: cap — too many candidates means genuine ambiguity
+                    if len(pool) > 3:
+                        continue
+                    mc_resolved = pool
+                    mc_conf, mc_conf_score = "INFERRED", 0.7
+
                 caller = rc["caller_nid"]
-                if (caller, ext_nid) not in existing_pairs:
-                    existing_pairs.add((caller, ext_nid))
-                    all_edges.append({
-                        "source": caller,
-                        "target": ext_nid,
-                        "relation": "calls_external",
-                        "context": "call",
-                        "confidence": "EXTRACTED",
-                        "confidence_score": 1.0,
-                        "source_file": src_file,
-                        "source_location": rc.get("source_location"),
-                        "weight": 1.0,
-                    })
+                for tgt in mc_resolved:
+                    if tgt == caller:
+                        continue
+                    if (caller, tgt) not in existing_pairs:
+                        existing_pairs.add((caller, tgt))
+                        all_edges.append({
+                            "source": caller,
+                            "target": tgt,
+                            "relation": "calls",
+                            "context": "call",
+                            "confidence": mc_conf,
+                            "confidence_score": mc_conf_score,
+                            "source_file": src_file,
+                            "source_location": rc.get("source_location"),
+                            "weight": 1.0,
+                        })
                 continue
             candidates = global_label_to_nids.get(callee.lower(), [])
             # Skip ambiguous names that resolve to multiple nodes — these are

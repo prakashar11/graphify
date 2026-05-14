@@ -819,12 +819,12 @@ def test_ts_external_call_named_import():
 
 
 def test_ts_external_call_node_created():
-    """External call nodes should have file_type='external_call' and be in all_nodes."""
+    """External call nodes should have file_type='concept' and be in all_nodes."""
     r = extract_js(FIXTURES / "external_calls.ts")
-    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "external_call"]
+    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "concept" and not n.get("source_file")]
     labels = {n["label"] for n in ext_nodes}
     assert any("jsonwebtoken" in lb for lb in labels), \
-        f"Expected external_call node for jsonwebtoken.decode, got: {labels}"
+        f"Expected concept node for jsonwebtoken.decode, got: {labels}"
 
 
 def test_ts_external_call_confidence():
@@ -1019,13 +1019,13 @@ def test_ts_require_default_binding_hoek():
 def test_ts_require_destructured_binding():
     """const {{ reach }} = require('hoek') should also produce a calls_external edge."""
     r = extract_js(FIXTURES / "commonjs_require.ts")
-    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "external_call"]
+    ext_nodes = [n for n in r["nodes"] if n.get("file_type") == "concept" and not n.get("source_file")]
     labels = {n["label"] for n in ext_nodes}
     # clone() is called directly (not as member call) — it's a named import ref,
     # not a member call, so no calls_external edge; but the binding should exist.
     # reach() via hoek.reach() should still appear.
     assert any("hoek" in lb for lb in labels), \
-        f"Expected external_call node for hoek.*, got: {labels}"
+        f"Expected concept node for hoek.*, got: {labels}"
 
 
 def test_ts_require_caller_is_buildcontext():

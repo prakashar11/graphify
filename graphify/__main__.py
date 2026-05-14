@@ -1081,7 +1081,8 @@ def main() -> None:
         print("                                    generic_arg, arg_ref")
         print("                            arg_ref: functions passed as callbacks/kwargs (e.g. context=buildContext)")
         print("                            call: covers both direct calls and calls_external (npm/stdlib library calls)")
-        print("    --budget N              cap output at N tokens (default 2000)")
+        print("    --budget N              cap output at N tokens per page (default 2000)")
+        print("    --page N                0-based page index for paginated output (default 0)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  save-result             save a Q&A result to graphify-out/memory/ for graph feedback loop")
         print("    --question Q            the question asked")
@@ -1278,7 +1279,7 @@ def main() -> None:
             sys.exit(1)
     elif cmd == "query":
         if len(sys.argv) < 3:
-            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
+            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--page N] [--graph path]", file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _query_graph_text
         from graphify.security import sanitize_label
@@ -1286,6 +1287,7 @@ def main() -> None:
         question = sys.argv[2]
         use_dfs = "--dfs" in sys.argv
         budget = 2000
+        page = 0
         graph_path = "graphify-out/graph.json"
         context_filters: list[str] = []
         args = sys.argv[3:]
@@ -1303,6 +1305,20 @@ def main() -> None:
                     budget = int(args[i].split("=", 1)[1])
                 except ValueError:
                     print(f"error: --budget must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
+            elif args[i] == "--page" and i + 1 < len(args):
+                try:
+                    page = int(args[i + 1])
+                except ValueError:
+                    print(f"error: --page must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--page="):
+                try:
+                    page = int(args[i].split("=", 1)[1])
+                except ValueError:
+                    print(f"error: --page must be an integer", file=sys.stderr)
                     sys.exit(1)
                 i += 1
             elif args[i] == "--context" and i + 1 < len(args):
@@ -1341,6 +1357,7 @@ def main() -> None:
                 depth=2,
                 token_budget=budget,
                 context_filters=context_filters,
+                page=page,
             )
         )
     elif cmd == "save-result":

@@ -160,37 +160,88 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
-    """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
+def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None, page: int = 0) -> str:
+    """Render subgraph as text with seed-first ordering and page-based pagination.
 
-    seeds: exact-match nodes rendered first before the degree-sorted expansion,
-    so the queried symbol always appears at the top of the output.
+    Output order: seed nodes → seed-adjacent edges → other nodes → other edges.
+    This guarantees edges involving the queried symbols appear within budget
+    even when the subgraph is large.
+
+    page: 0-based page index. Each page is ~token_budget tokens.
     """
     char_budget = token_budget * 3
-    lines = []
     seed_set = set(seeds or [])
-    ordered = [n for n in (seeds or []) if n in nodes] + \
-              sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
-    for nid in ordered:
+
+    def _node_line(nid: str) -> str:
         d = G.nodes[nid]
-        line = f"NODE {sanitize_label(d.get('label', nid))} [src={d.get('source_file', '')} loc={d.get('source_location', '')} community={d.get('community', '')}]"
-        lines.append(line)
-    for u, v in edges:
-        if u in nodes and v in nodes:
-            raw = G[u][v]
-            d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
-            context = d.get("context")
-            context_suffix = f" context={context}" if context else ""
-            line = (
-                f"EDGE {sanitize_label(G.nodes[u].get('label', u))} "
-                f"--{d.get('relation', '')} [{d.get('confidence', '')}{context_suffix}]--> "
-                f"{sanitize_label(G.nodes[v].get('label', v))}"
-            )
-            lines.append(line)
-    output = "\n".join(lines)
-    if len(output) > char_budget:
-        output = output[:char_budget] + f"\n... (truncated to ~{token_budget} token budget)"
-    return output
+        return f"NODE {sanitize_label(d.get('label', nid))} [src={d.get('source_file', '')} loc={d.get('source_location', '')} community={d.get('community', '')}]"
+
+    def _edge_line(u: str, v: str) -> str:
+        raw = G[u][v]
+        d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
+        context = d.get("context")
+        context_suffix = f" context={context}" if context else ""
+        return (
+            f"EDGE {sanitize_label(G.nodes[u].get('label', u))} "
+            f"--{d.get('relation', '')} [{d.get('confidence', '')}{context_suffix}]--> "
+            f"{sanitize_label(G.nodes[v].get('label', v))}"
+        )
+
+    seed_nodes = [n for n in (seeds or []) if n in nodes]
+    other_nodes = sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
+    valid_edges = [(u, v) for u, v in edges if u in nodes and v in nodes]
+    # BFS skips edges between start nodes (both already visited) — supplement by
+    # querying the graph directly for any edges between seed nodes.
+    bfs_edge_set = set(valid_edges)
+    for s in seed_nodes:
+        for nb in G.neighbors(s):
+            if nb in seed_set and nb in nodes and (s, nb) not in bfs_edge_set and (nb, s) not in bfs_edge_set:
+                valid_edges.append((s, nb))
+                bfs_edge_set.add((s, nb))
+    seed_edges = [(u, v) for u, v in valid_edges if u in seed_set or v in seed_set]
+    other_edges = [(u, v) for u, v in valid_edges if u not in seed_set and v not in seed_set]
+
+    lines: list[str] = []
+    for nid in seed_nodes:
+        lines.append(_node_line(nid))
+    for u, v in seed_edges:
+        lines.append(_edge_line(u, v))
+    for nid in other_nodes:
+        lines.append(_node_line(nid))
+    for u, v in other_edges:
+        lines.append(_edge_line(u, v))
+
+    # Fast path: everything fits on page 0
+    if page == 0:
+        output = "\n".join(lines)
+        if len(output) <= char_budget:
+            return output
+
+    # Paginate: accumulate lines until char_budget is reached per page
+    pages: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 for newline
+        if current_len + line_len > char_budget and current:
+            pages.append(current)
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        pages.append(current)
+
+    total = len(pages)
+    if page >= total:
+        return f"Page {page} out of range — {total} page(s) available (0–{total - 1})."
+    suffix = (
+        f"\n... Page {page + 1}/{total} — use --page {page + 1} for more"
+        if page + 1 < total
+        else f"\n... Page {page + 1}/{total} (last page)"
+    )
+    return "\n".join(pages[page]) + suffix
 
 
 def _query_graph_text(
@@ -201,6 +252,7 @@ def _query_graph_text(
     depth: int = 3,
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
+    page: int = 0,
 ) -> str:
     terms = [t.lower() for t in question.split() if len(t) > 2]
     scored = _score_nodes(G, terms)
@@ -217,8 +269,10 @@ def _query_graph_text(
     if resolved_filters:
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
+    if page > 0:
+        header_parts.append(f"page={page}")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes, page=page)
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
@@ -286,7 +340,8 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
                         "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs",
                                  "description": "bfs=broad context, dfs=trace a specific path"},
                         "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
-                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens per page"},
+                        "page": {"type": "integer", "default": 0, "description": "0-based page index for paginated output — use when output is truncated"},
                         "context_filter": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -373,6 +428,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
         mode = arguments.get("mode", "bfs")
         depth = min(int(arguments.get("depth", 3)), 6)
         budget = int(arguments.get("token_budget", 2000))
+        page = int(arguments.get("page", 0))
         context_filter = arguments.get("context_filter")
         return _query_graph_text(
             G,
@@ -381,6 +437,7 @@ def serve(graph_path: str = "graphify-out/graph.json") -> None:
             depth=depth,
             token_budget=budget,
             context_filters=context_filter,
+            page=page,
         )
 
     def _tool_get_node(arguments: dict) -> str:

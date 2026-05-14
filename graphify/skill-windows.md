@@ -32,7 +32,8 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify add <url> --contributor "Name"              # tag who added it to the corpus
 /graphify query "<question>"                          # BFS traversal - broad context
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
-/graphify query "<question>" --budget 1500            # cap answer at N tokens
+/graphify query "<question>" --budget 1500            # cap output at N tokens per page
+/graphify query "<question>" --page 1              # get next page when output is truncated
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node
 ```
@@ -1031,12 +1032,12 @@ for u, v in subgraph_edges:
 
 output = '\n'.join(lines)
 if len(output) > char_budget:
-    output = output[:char_budget] + f'\n... (truncated at ~{token_budget} token budget - use --budget N for more)'
+    output = output[:char_budget] + f'\n... Page 1/? — use --page 1 for more, --budget N to resize pages'
 print(output)
 "
 ```
 
-Replace `QUESTION` with the user's actual question, `MODE` with `bfs` or `dfs`, and `BUDGET` with the token budget (default `2000`, or whatever `--budget N` specifies). Then answer based on the subgraph output above.
+Replace `QUESTION` with the user's actual question, `MODE` with `bfs` or `dfs`, `BUDGET` with the token budget (default `2000`), and `PAGE` with the page index (default `0`). If output ends with "Page 1/?" use `--page 1` to fetch the next page. Then answer based on the subgraph output above.
 
 After writing the answer, save it back into the graph so it improves future queries:
 
