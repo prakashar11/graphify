@@ -256,7 +256,13 @@ def _query_graph_text(
 ) -> str:
     terms = [t.lower() for t in question.split() if len(t) > 2]
     scored = _score_nodes(G, terms)
-    start_nodes = [nid for _, nid in scored[:3]]
+    # If any node has an exact-match bonus, restrict start nodes to exact-match nodes only.
+    # This prevents fuzzy/substring co-riders (e.g. TestCase subclasses, concept nodes) from
+    # flooding BFS when the user named a specific class or function.
+    if scored and scored[0][0] >= _EXACT_MATCH_BONUS:
+        start_nodes = [nid for score, nid in scored if score >= _EXACT_MATCH_BONUS][:3]
+    else:
+        start_nodes = [nid for _, nid in scored[:3]]
     if not start_nodes:
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
